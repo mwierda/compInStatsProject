@@ -1,0 +1,168 @@
+---
+title: "Comp Proj"
+author: "Mac Wierda"
+date: "2025-12-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Clean data
+```{r}
+set.seed(5400)
+library(dplyr)
+
+# load datasets
+energy.df = read.csv('./energy_dataset.csv')
+weather.df = read.csv('./weather_features.csv')
+
+# remove unneeded columns
+energy.df.clean = na.omit(energy.df[,-2:-25])
+weather.df.clean = na.omit(weather.df[,-4:-17])
+weather.df.clean.madrid = subset(weather.df.clean, city_name=='Madrid')
+
+energy.df.clean[1,1] == weather.df.clean.madrid[1,1]
+energy.df.head = energy.df.clean[-1:-1878,]
+energy.df.tail = energy.df.head[-4410:-333150,]
+energy.indices = 1:4409
+rownames(energy.df.tail) = energy.indices
+
+weather.df.head = weather.df.clean.madrid[-1:-1896,]
+weather.df.tail = weather.df.head[-4427:-34371,]
+weather.indices = 1:4426
+rownames(weather.df.tail) = weather.indices
+```
+
+```{r}
+# add missing weather data
+
+# inserts before this index
+badIndex = 195
+
+# finds missing index
+# for (i in 1:nrow(weather.df.tail)) {
+#   if (weather.df.tail[i,1] != energy.df.tail[i,1]) {
+#     badIndex = i
+#     print(i)
+#     print(energy.df.tail[i,1])
+#     break
+#   }
+#   if (i == 195) {
+#     badIndex = 195
+#     break
+#   }
+# }
+
+if (badIndex != 0) {
+  # get missing datetime value
+  missing.dt = '2015-03-29 02:00:00+02:00'
+  prev = weather.df.tail[(i-24):i,]
+  nex = weather.df.tail[i:(i+24),]
+  
+  # get average energy values for previous and next 24 hours
+  avg.temp = mean(prev$temp + nex$temp) / 2
+  
+  # create the missing row using average values
+  missingRow = data.frame(dt_iso=missing.dt, city_name='Madrid', temp=avg.temp)
+  
+  # add missing row into dataframe at correct point
+  weather.df.tail = weather.df.tail %>% add_row(missingRow, .before=badIndex)
+}
+```
+
+```{r}
+# adding missing rows to energy data
+# only missing 17 data points, so just ran this 17 times manually; should do nothing now
+
+# inserts before this index
+badIndex = 0
+
+# finds missing index
+for (i in 1:nrow(energy.df.tail)) {
+  if (energy.df.tail[i,1] != weather.df.tail[i,1]) {
+    badIndex = i
+    print(i)
+    print(weather.df.tail[i,1])
+    break
+  }
+}
+
+if (badIndex != 0) {
+  # get missing datetime value
+  missing.dt = weather.df.tail[badIndex,1]
+  prev = energy.df.tail[(i-24):i,]
+  nex = energy.df.tail[i:(i+24),]
+  
+  # get average energy values for previous and next 24 hours
+  avg.tfl = mean(prev$total.load.forecast + nex$total.load.forecast) / 2
+  avg.tla = mean(prev$total.load.actual + nex$total.load.actual) / 2
+  avg.pda = mean(prev$price.day.ahead + nex$price.day.ahead) / 2
+  avg.pa = mean(prev$price.actual + nex$price.actual) / 2
+  
+  # create the missing row using average values
+  missingRow = data.frame(time=missing.dt,
+                          total.load.forecast=avg.tfl,
+                          total.load.actual=avg.tla,
+                          price.day.ahead=avg.pda,
+                          price.actual=avg.pa)
+  
+  # add missing row into dataframe at correct point
+  energy.df.tail = energy.df.tail %>% add_row(missingRow, .before=badIndex)
+}
+```
+
+```{r}
+# replace energy weekend data with averages of following week
+energy.df.temp = energy.df.tail
+
+init.index = 1
+while (init.index + 48 < nrow(tmp)) {
+  nxt.wkdays = energy.df.temp[(init.index+47):(init.index+47+119),]
+  
+  # create averages for next week (last weekend will use previous week)
+  avg.tfl = mean(nxt.wkdays$total.load.forecast)
+  avg.tla = mean(nxt.wkdays$total.load.actual)
+  avg.pda = mean(nxt.wkdays$price.day.ahead)
+  avg.pa = mean(nxt.wkdays$price.actual)
+  
+  # new data; don't need dt already exists, just need to replace existing data with averages
+  new.data = data.frame(total.load.forecast=avg.tfl,
+                        total.load.actual=avg.tla,
+                        price.day.ahead=avg.pda,
+                        price.actual=avg.pa)
+  
+  # replace weekend data
+  energy.df.temp[init.index:(init.index+47),2:5] = new.data
+  
+  init.index = init.index + 168
+}
+```
+
+```{r}
+# for last weekend in energy, use previous week data
+# missing week data, rows: 4369 - 4379; replaced with avg of previous week where possible
+start = 4254 # start of week
+end = 4368 # last data point in week
+
+nxt.wkdays = energy.df.temp[4254:4368,]
+
+avg.tfl = mean(nxt.wkdays$total.load.forecast)
+avg.tla = mean(nxt.wkdays$total.load.actual)
+avg.pda = mean(nxt.wkdays$price.day.ahead)
+avg.pa = mean(nxt.wkdays$price.actual)
+
+new.data = data.frame(total.load.forecast=avg.tfl,
+                        total.load.actual=avg.tla,
+                        price.day.ahead=avg.pda,
+                        price.actual=avg.pa)
+
+energy.df.temp[4369:4427, 2:5] = new.data
+```
+
+```{r}
+df.final.clean = cbind(energy.df.temp, temp=weather.df.tail[3])
+write.csv(df.final.clean, file='./energy_weather_data.csv', row.names=FALSE)
+```
+
