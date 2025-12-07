@@ -19,7 +19,7 @@ library(forecast)
 
 # read in energy/weather data
 # ew.df = energy weather data frame
-setwd("C:/Users/trevd/Dropbox/PC/Downloads")
+setwd("put your file path or use githyb file path")
 ew.df = read.csv('./energy_weather_data.csv')
 
 # test data
