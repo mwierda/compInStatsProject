@@ -1,0 +1,499 @@
+---
+title: "Total Code"
+author: "Trevor DeButch"
+date: "2025-12-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+set.seed(5400)
+```
+
+## Load Models
+
+### Data Setup
+```{r}
+#import libraries
+library(forecast)
+
+# read in energy/weather data
+# ew.df = energy weather data frame
+setwd("C:/Users/trevd/Dropbox/PC/Downloads")
+ew.df = read.csv('./energy_weather_data.csv')
+
+# test data
+ew.df.test = ew.df[(4427-143):4427,]
+
+# training data; decided to just remove test data, rather than replace with an average response
+ew.df.train = ew.df[-(4427-143):-4427,]
+
+# first model only needs the datetime and actual load data, not temp or anything else
+ew.df.train.load = ew.df.train[,c(1,3)]
+ew.df.test.load = ew.df.test[,c(1,3)]
+
+# create time series versions of data sets with hourly frequency
+ew.df.train.load.ts = ts(ew.df.train.load$total.load.actual, frequency=24)
+ew.df.test.load.ts = ts(ew.df.test.load$total.load.actual, frequency=24)
+```
+
+## Finding correct ARIMA model
+```{r}
+# visualization of load data
+plot(ew.df.train.load.ts, type='l', xlab='time', ylab='load')
+
+# looking to make an 'arima' model of the data = Auto-Regressive Integrated Moving Average
+# Forecast library contains a lot of convienent methods
+# ggtsdisplay plots the times series with ACF and PACF graphs
+# the base data does have changing variance, so we'll plot it with one difference
+# plot with 1 difference below
+ts.diff = diff(ew.df.train.load.ts)
+
+ggtsdisplay(ts.diff)
+
+# data is cleary stationary now: mean, varaince, and autocorrelation don't change over time
+# ACF = ts correlation with lagged version of itself; starts at lag 0 == correlation with itself => 1
+# PACF = additional correlation explained by each successive lag term
+# anything outside blue area = 95% significance threshold
+# ACF plot has several significant lags, but when we check the PACF we see that it's primarily lag=1 that is
+#   significant
+# Thus, lag 1 should be sufficient. And if we run the 'auto.arima' function below, it'll calculate the best result for us
+
+if (!exists('arima.res.auto')) {
+  arima.res.auto = auto.arima(ts.diff)
+}
+arima.res.auto
+checkresiduals(arima.res.auto)
+
+# We get ARIMA(1,0,1)(2,0,0) with zero mean
+# unfortunately we still have correlation in our data; this is the best we can do, it seems, so our result
+#   isn't gonna be super conclusive compared to the original paper
+```
+
+## Fitting individual regr models for model 2
+```{r}
+# basic regression and qq plot comparison indicates it's a fairly linear relationship, so don't need
+#   to use a different model
+plot(lm(total.load.actual ~ temp, ew.df.train))
+
+# can include regression in auto.arima with the 'xreg' parameter
+aa.x = auto.arima(ts.diff, xreg=ew.df.train[1:4282,6])
+aa.x
+
+```
+
+## Generator Data
+
+```{r}
+#we dont have our own generator data so we are just using the same information that 
+#they used in the paper, this table is exactly what they claimed to use for generators
+
+costUnserved <- 135
+
+generatorDf <- data.frame(
+  capacity = c(
+    400, 400,
+    350,
+    rep(150, 4),
+    150, 150,
+    rep(200, 3),
+    rep(100, 3),
+    50,
+    100
+  ),
+  mttf = c(
+    1100, 1100,
+    1150,
+    rep(960, 4),
+    1960, 1960,
+    rep(950, 3),
+    rep(1200, 3),
+    2940,
+    450
+  ),
+  mttr = c(
+    150, 150,
+    100,
+    rep(40, 4),
+    40, 40,
+    rep(50, 3),
+    rep(50, 3),
+    60,
+    50
+  ),
+  cost = c(
+    6.00, 6.00,
+    11.40,
+    rep(11.40, 4),
+    14.40, 14.40,
+    rep(22.08, 3),
+    rep(23.00, 3),
+    27.60,
+    43.50
+  )
+)
+```
+
+## Generator Function/Class
+
+```{r}
+#function that creates the generator objects
+buildGenerators <- function(generatorDf, dt = 1) {
+  genList <- vector("list", nrow(generatorDf))
+  
+  for (i in seq_len(nrow(generatorDf))) {
+    capacity <- generatorDf$capacity[i]
+    mttf     <- generatorDf$mttf[i]
+    mttr     <- generatorDf$mttr[i]
+    cost     <- generatorDf$cost[i]
+    
+    lambda   <- 1 / mttf
+    mu       <- 1 / mttr
+    rateSum  <- lambda + mu
+    
+    piUp   <- mu / rateSum
+    piDown <- 1 - piUp
+    
+    e      <- exp(-rateSum * dt)
+    pUpUp  <- piUp   + piDown * e
+    pUpDown <- 1 - pUpUp
+    pDownDown <- piDown + piUp * e
+    pDownUp   <- 1 - pDownDown
+    
+    transMat <- matrix(
+      c(pUpUp,    pUpDown,
+        pDownUp,  pDownDown),
+      nrow = 2, byrow = TRUE
+    )
+    
+    genList[[i]] <- list(
+      capacity = capacity,
+      cost     = cost,
+      piUp     = piUp,
+      transMat = transMat
+    )
+  }
+  
+  genList
+}
+
+generators <- buildGenerators(generatorDf, dt = 1)
+```
+
+## GeneratorSimulations
+
+```{R}
+simulateGeneratorScenarios <- function(generators, horizonHours, numScenarios) {
+  # Returns a list of length numScenarios; each element is a logical matrix:
+  # rows = generators, cols = hours, TRUE = up
+  
+  numGens <- length(generators)
+  scenarioList <- vector("list", numScenarios)
+  
+  for (q in seq_len(numScenarios)) {
+    stateMat <- matrix(FALSE, nrow = numGens, ncol = horizonHours)
+    
+    for (g in seq_len(numGens)) {
+      gen     <- generators[[g]]
+      piUp    <- gen$piUp
+      transMat <- gen$transMat
+      upNow <- runif(1) < piUp
+      stateIndex <- if (upNow) 1L else 2L
+      
+      for (t in seq_len(horizonHours)) {
+        stateMat[g, t] <- (stateIndex == 1L)
+        probs <- transMat[stateIndex, ]
+        stateIndex <- sample(1:2, size = 1, prob = probs)
+      }
+    }
+    
+    scenarioList[[q]] <- stateMat
+  }
+  
+  scenarioList
+}
+
+```
+
+## Cost for Paths Function
+
+```{r}
+costUnserved <- 135
+#here is a functiont that grabs the cheapest generator and uses it for power
+#this is the same thing they do in the paper and is a good function for recreating the paper
+computeCostForPath <- function(loadVec, genStates, generators,
+                               costUnserved = NULL,
+                               dt = 1) {
+  if (is.null(costUnserved)) {
+    costUnserved <- get("costUnserved", envir = .GlobalEnv)
+  }
+  # loadVec: numeric length T (MW)
+  # genStates: logical matrix [numGens x T], TRUE = up
+  
+  horizonHours <- length(loadVec)
+  numGens <- length(generators)
+  
+  # merit order: cheapest to most expensive
+  genCosts <- vapply(generators, function(g) g$cost, numeric(1))
+  orderIdx <- order(genCosts)
+  
+  totalCost <- 0
+  
+  for (t in seq_len(horizonHours)) {
+    demand    <- loadVec[t]
+    remaining <- demand
+    
+    for (idx in orderIdx) {
+      if (!genStates[idx, t]) next  # checks the gen status if down or not
+      
+      capacity <- generators[[idx]]$capacity
+      cost     <- generators[[idx]]$cost
+      
+      if (remaining <= 0) break
+      
+      genPower <- min(capacity, remaining)
+      energyMWh <- genPower * dt
+      totalCost <- totalCost + energyMWh * cost
+      remaining <- remaining - genPower
+    }
+    
+    if (remaining > 0) {
+      totalCost <- totalCost + remaining * dt * costUnserved
+    }
+  }
+  totalCost
+}
+```
+
+## Monte Carlo Function
+
+```{r}
+monteCarloProductionCost <- function(loadPaths, generators,
+                                     numScenarios = 300) {
+  # loadPaths: matrix [numPaths x horizonHours]
+  # returns a list:
+  #   $costs        : matrix [numPaths x numScenarios]
+  #   $genScenarios: list of generator state matrices
+  
+  loadMat <- as.matrix(loadPaths)
+  numPaths <- nrow(loadMat) #this is the Ul from the paper
+  horizonHours <- ncol(loadMat) # this is Sq from the paper
+  
+  genScenarios <- simulateGeneratorScenarios(
+    generators,
+    horizonHours = horizonHours,
+    numScenarios = numScenarios
+  )
+  
+  costs <- matrix(NA_real_, nrow = numPaths, ncol = numScenarios)
+  
+  for (p in seq_len(numPaths)) {
+    loadVec <- loadMat[p, ]
+    for (s in seq_len(numScenarios)) {
+      genStates <- genScenarios[[s]]
+      costs[p, s] <- computeCostForPath(
+        loadVec = loadVec,
+        genStates = genStates,
+        generators = generators
+      )
+    }
+  }
+  
+  list(costs = costs, genScenarios = genScenarios)
+}
+```
+
+## Variable instantiation
+
+```{r}
+#pick a day to focus on as the paper also picks a few specific days to focus on
+
+testStartIndex <- 1          # first hour in ew.df.test
+testEndIndex   <- 24         # 24th hour (so one total day, may be worth trying a larger time period?)
+
+loadTestVec  <- ew.df.test$total.load.actual[testStartIndex:testEndIndex]
+tempTestVec  <- ew.df.test$temp[testStartIndex:testEndIndex]
+horizonHours <- length(loadTestVec)
+```
+
+## Model 1
+
+```{r}
+#model 1 without temp
+
+loadModel1 <- auto.arima(ew.df.train.load.ts)
+```
+
+## Model 2
+
+```{r}
+# Model 2, this one was difficult to make work so there is lots of AI help on this part
+
+tempTrain    <- ew.df.train$temp
+coolingTrain <- pmax(tempTrain - 65, 0)  # (temp - 65)+
+
+regFit <- lm(
+  total.load.actual ~ temp + cooling,
+  data = data.frame(
+    total.load.actual = ew.df.train$total.load.actual,
+    temp    = tempTrain,
+    cooling = coolingTrain
+  )
+)
+
+# ----- Fit AR(1) on regression residuals -----
+
+residTs    <- ts(regFit$residuals, frequency = 24)
+residModel <- Arima(residTs, order = c(1, 0, 0))
+```
+
+## Default Model For Checks
+
+```{r}
+# this is a base model with no load uncertainty, it only has the generator function unscertainty
+simulateLoadPathsModel0 <- function(loadVec, numPaths) {
+  #rep the same loadVec numPaths times as rows of a matrix
+  matrix(rep(loadVec, each = numPaths), nrow = numPaths)
+}
+```
+
+## Load Paths for Model 1
+
+```{r}
+# This model is the 1st model without temp and has load pahts factored into this model
+simulateLoadPathsModel1 <- function(loadModel, horizonHours, numPaths) {
+  # Each column of replicate() is one simulated path from the ARIMA model
+  pathMatrix <- replicate(
+    numPaths,
+    as.numeric(simulate(loadModel, nsim = horizonHours))
+  )
+  
+  # We want paths as rows, so transpose
+  t(pathMatrix)
+}
+```
+
+## Load Paths for Model 2
+
+```{r}
+#Here is model 2 with temp factored in
+simulateLoadPathsModel2 <- function(regFit, residModel,
+                                    tempFuture, numPaths) {
+  horizonHours   <- length(tempFuture)
+  coolingFuture  <- pmax(tempFuture - 65, 0)
+  
+  # Design matrix for intercept, temp, cooling
+  designMat <- cbind(
+    1,
+    tempFuture,
+    coolingFuture
+  )
+  beta <- coef(regFit)
+  beta[is.na(beta)] <- 0
+  
+  # Deterministic regression mean for each hour
+  regMean <- as.numeric(designMat %*% beta)
+  
+  # Quick sanity check for debugging
+  cat("anyNA(regMean):", anyNA(regMean), "\n")
+  cat("head(regMean):", head(regMean), "\n")
+  
+  # Simulate residuals and add regression mean
+  pathMatrix <- replicate(
+    numPaths,
+    regMean + as.numeric(simulate(residModel, nsim = horizonHours))
+  )
+  
+  t(pathMatrix)
+}
+```
+
+## Simulations Are Run
+
+```{r}
+numPaths     <- 300  # L
+numScenarios <- 300  # Q
+
+
+#simulate load paths
+loadPaths0 <- simulateLoadPathsModel0(loadTestVec, numPaths)
+loadPaths1 <- simulateLoadPathsModel1(loadModel1, horizonHours, numPaths)
+loadPaths2 <- simulateLoadPathsModel2(regFit, residModel, tempTestVec, numPaths)
+
+
+#run the monte carlo
+mc0 <- monteCarloProductionCost(loadPaths0, generators, numScenarios = numScenarios)
+mc1 <- monteCarloProductionCost(loadPaths1, generators, numScenarios = numScenarios)
+mc2 <- monteCarloProductionCost(loadPaths2, generators, numScenarios = numScenarios)
+```
+
+## Outputs
+
+```{r}
+#variable outcomes
+varianceComponents <- function(costMatrix) {
+  numPaths     <- nrow(costMatrix)
+  numScenarios <- ncol(costMatrix)
+  dfLong <- data.frame(
+    cost     = as.vector(costMatrix),
+    loadPath = factor(rep(1:numPaths, each = numScenarios))
+  )
+  
+  # One-way ANOVA: cost ~ loadPath
+  aovFit <- aov(cost ~ loadPath, data = dfLong)
+  tab    <- summary(aovFit)[[1]]
+  
+  meanSqLoad <- tab["loadPath", "Mean Sq"]
+  meanSqGen  <- tab["Residuals", "Mean Sq"]
+  
+  varGen  <- meanSqGen
+  varLoad <- (meanSqLoad - meanSqGen) / numScenarios
+  if (varLoad < 0) varLoad <- 0
+  
+  varTotal <- varGen + varLoad
+  
+  list(
+    meanSqLoad = meanSqLoad,
+    meanSqGen  = meanSqGen,
+    varGen     = varGen,
+    varLoad    = varLoad,
+    varTotal   = varTotal
+  )
+}
+
+vc0 <- varianceComponents(mc0$costs)
+vc1 <- varianceComponents(mc1$costs)
+vc2 <- varianceComponents(mc2$costs)
+```
+
+```{r}
+#final model outcomes
+summarizeMc <- function(costMatrix, vc) {
+  meanCost <- mean(costMatrix)
+  
+  data.frame(
+    meanCost = meanCost,
+    varTotal = vc$varTotal,
+    varLoad  = vc$varLoad,
+    varGen   = vc$varGen,
+    fracLoad = vc$varLoad / vc$varTotal
+  )
+}
+
+summary0 <- summarizeMc(mc0$costs, vc0)
+summary1 <- summarizeMc(mc1$costs, vc1)
+summary2 <- summarizeMc(mc2$costs, vc2)
+
+modelSummary <- rbind(
+  Model1 = summary1,
+  Model2 = summary2
+)
+
+modelSummary
+```
+
+```
+Above we see that from model 1 to model 2 the load variance contribution (frac load)
+did go down, this is what the paper found but our numbers are very small we can still see 
+the pattern the paper recognized.
+```
